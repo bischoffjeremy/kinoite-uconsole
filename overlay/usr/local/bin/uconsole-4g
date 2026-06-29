@@ -1,0 +1,71 @@
+#!/bin/bash
+# Fedora/libgpiod port of ClockworkPi's /usr/local/bin/uconsole-4g-cm4.
+# SAME logic, SAME pins, SAME timings - only the GPIO tool differs (libgpiod
+# `gpioset` instead of WiringPi `gpio`). Manual, like the original:
+#   sudo uconsole-4g enable    # power the modem on (returns, modem stays on)
+#   sudo uconsole-4g disable   # power the modem off
+#   uconsole-4g status         # mmcli -L
+#
+# WiringPi -> BCM (verified from ClockworkPi's wiringPi source, stock R2 table):
+#   wPi 24 -> BCM GPIO19  = power enable
+#   wPi 15 -> BCM GPIO14  = modem key / reset
+#
+# WiringPi's `gpio` leaves a pin driven after exit; libgpiod releases the line
+# when the process ends. So each held level is kept by a DETACHED `gpioset`
+# (own session via setsid) that survives this script exiting - mirroring the
+# original behaviour where the pin stays set after the command returns.
+set -u
+
+CHIP="$(gpiodetect 2>/dev/null | awk '/pinctrl-bcm/{print $1; exit}')"
+CHIP="${CHIP:-gpiochip0}"
+
+PWR=19   # wPi 24 - power enable
+KEY=14   # wPi 15 - modem key / reset
+RUNDIR=/run/uconsole-4g
+
+# hold <line> <value> <name>  -- drive <line> to <value> and keep it driven,
+# detached, until unhold/reboot (equivalent of WiringPi "gpio write").
+hold() {
+  mkdir -p "$RUNDIR"
+  setsid bash -c "echo \$\$ > '$RUNDIR/$3.pid'; exec gpioset -c '$CHIP' '$1=$2'" \
+    </dev/null >/dev/null 2>&1 &
+  sleep 0.2
+}
+
+# unhold <name>  -- release a previously held line.
+unhold() {
+  [ -f "$RUNDIR/$1.pid" ] && kill "$(cat "$RUNDIR/$1.pid")" 2>/dev/null
+  rm -f "$RUNDIR/$1.pid"
+}
+
+case "${1:-}" in
+  enable)
+    echo "Power on 4G module on uConsole cm4"
+    hold "$PWR" 1 pwr        # gpio write 24 1  (power enable, stays on)
+    hold "$KEY" 1 key        # gpio write 15 1
+    sleep 5
+    unhold key               # gpio write 15 0 ...
+    hold "$KEY" 0 key        #   ... driven low and held
+    echo "waiting..."
+    sleep 13
+    echo "done"
+    ;;
+  disable)
+    echo "Power off 4G module"
+    unhold key
+    hold "$PWR" 0 pwr        # gpio write 24 0
+    unhold pwr; hold "$PWR" 1 pwr   # gpio write 24 1
+    sleep 3
+    unhold pwr; hold "$PWR" 0 pwr   # gpio write 24 0
+    sleep 20
+    unhold pwr               # release (modem off)
+    echo "Done"
+    ;;
+  status)
+    exec mmcli -L            # "use mmcli -L to see 4G modem or not"
+    ;;
+  *)
+    echo "usage: ${0##*/} {enable|disable|status}" >&2
+    exit 2
+    ;;
+esac

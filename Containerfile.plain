@@ -1,0 +1,76 @@
+# Plain (non-atomic) Fedora KDE for the uConsole CM4.
+# Mutable, persistent system: writable ext4 root, dnf works, files survive
+# reboots. Same uConsole kernel/firmware/4G as the atomic image, but on a
+# regular rpm/dnf Fedora base - no ostree/composefs.
+#
+# Build context (prepared by the workflow):
+#   cm4/vmlinuz, cm4/modules/<kver>/, cm4/fw-brcm/, cm4/fw-cypress/
+FROM quay.io/fedora/fedora:44
+
+COPY cm4/vmlinuz     /tmp/cm4/vmlinuz
+COPY cm4/modules/    /tmp/cm4/modules/
+COPY cm4/fw-brcm/    /tmp/cm4/fw-brcm/
+COPY cm4/fw-cypress/ /tmp/cm4/fw-cypress/
+COPY overlay/        /
+
+RUN set -eux; \
+    # Base system + KDE desktop (no sddm: Fedora 44 KDE uses plasmalogin).
+    dnf install -y \
+        @core @kde-desktop-environment \
+        NetworkManager ModemManager libgpiod-utils \
+        cloud-utils-growpart e2fsprogs \
+        dracut kmod systemd udev sudo; \
+    \
+    # uConsole kernel + modules (the base image ships no kernel).
+    mkdir -p /usr/lib/modules; \
+    cp -a /tmp/cm4/modules/* /usr/lib/modules/; \
+    KVER="$(ls /usr/lib/modules | head -1)"; \
+    echo "kernel version: $KVER"; \
+    cp /tmp/cm4/vmlinuz "/usr/lib/modules/$KVER/vmlinuz"; \
+    \
+    # WLAN/BT firmware (same as the atomic image).
+    mkdir -p /usr/lib/firmware/brcm /usr/lib/firmware/cypress; \
+    cp -a /tmp/cm4/fw-brcm/.    /usr/lib/firmware/brcm/; \
+    cp -a /tmp/cm4/fw-cypress/. /usr/lib/firmware/cypress/; \
+    ln -sf cyfmac43455-sdio-standard.bin /usr/lib/firmware/cypress/cyfmac43455-sdio.bin; \
+    test -e /usr/lib/firmware/brcm/brcmfmac43455-sdio.bin || { echo "ERROR: WLAN firmware missing"; exit 1; }; \
+    \
+    # initramfs without ostree (mutable system).
+    depmod -a "$KVER"; \
+    dracut --no-hostonly --reproducible --force \
+        --kver "$KVER" "/usr/lib/modules/$KVER/initramfs.img"; \
+    \
+    # 4G control script (manual, like the original).
+    chmod +x /usr/local/bin/uconsole-4g; \
+    # Grow the root partition to fill the eMMC/SD on first boot.
+    chmod +x /usr/local/bin/uconsole-growroot; \
+    \
+    # Default user: uconsole / uconsole, sudo via wheel, no autologin.
+    useradd -m -G wheel -s /bin/bash uconsole; \
+    echo 'uconsole:uconsole' | chpasswd; \
+    \
+    # Services + graphical target.
+    systemctl enable NetworkManager.service ModemManager.service; \
+    systemctl enable uconsole-growroot.service; \
+    systemctl set-default graphical.target; \
+    \
+    # No OOBE wizard: plasma-setup's autologin session never renders on this
+    # hand-built image and hangs before the real login. Mask it and set the
+    # done flag so boot goes straight to plasmalogin. (The real first-run
+    # wizard ships with the atomic Kinoite image.)
+    systemctl mask plasma-setup.service; \
+    : > /etc/plasma-setup-done; \
+    \
+    # Empty machine-id: a unique ID is generated on first boot (same as Kinoite).
+    : > /etc/machine-id; \
+    \
+    # KDE perf: weak VC4/V3D GPU -> shorten animations, disable Blur/Contrast.
+    # Lean defaults in /etc/xdg, merged via kwriteconfig6 (user can revert in
+    # System Settings).
+    mkdir -p /etc/xdg; \
+    kwriteconfig6 --file /etc/xdg/kdeglobals --group KDE --key AnimationDurationFactor 0.25; \
+    kwriteconfig6 --file /etc/xdg/kwinrc --group Plugins --key blurEnabled false; \
+    kwriteconfig6 --file /etc/xdg/kwinrc --group Plugins --key contrastEnabled false; \
+    \
+    rm -rf /tmp/cm4; \
+    dnf clean all

@@ -1,0 +1,11 @@
+# Large/generated files don't belong in the repo
+*.tar
+*.qcow2
+*.img
+*.img.*
+output/
+fake-storage/
+build.log
+
+# Internal notes - local only, not public
+*.local.md

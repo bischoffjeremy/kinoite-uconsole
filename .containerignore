@@ -1,0 +1,17 @@
+# Keep the build context small: exclude anything large, otherwise the build
+# fills RAM (/tmp is a tmpfs) and the system freezes.
+*.tar
+*.qcow2
+*.img
+*.img.*
+official.img
+output/
+boot/
+root/
+fake-storage/
+build-qcow2.sh
+build.log
+.git/
+# cm4/firmware is only needed when assembling the image, not in the container
+# build -> keep it out of the build context.
+cm4/firmware/

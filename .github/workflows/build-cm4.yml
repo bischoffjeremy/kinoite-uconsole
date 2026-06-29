@@ -1,0 +1,289 @@
+name: Build uConsole CM4
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMG_URL: http://dl.clockworkpi.com/uConsole_CM4_v3.1_64bit.img.bz2
+  IMG_MD5: 1b31b501d11d95da7f1380d50d47a8a9
+  KVER: 6.12.62-v8+
+  R2_ENDPOINT: https://0fad92fab7b77c778f87fcd86efdb5c0.r2.cloudflarestorage.com
+  R2_BUCKET: uconsole-fedora
+
+jobs:
+  # Only build the image whose files changed. overlay/ + workflow count for
+  # both; a manual run builds both.
+  changes:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      plain: ${{ steps.flags.outputs.plain }}
+      atomic: ${{ steps.flags.outputs.atomic }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            plain:
+              - 'Containerfile.plain'
+              - 'overlay/**'
+              - '.github/workflows/build-cm4.yml'
+            atomic:
+              - 'Containerfile.atomic'
+              - 'bib-atomic.toml'
+              - 'overlay/**'
+              - '.github/workflows/build-cm4.yml'
+      - id: flags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            P=true; A=true
+          else
+            P='${{ steps.filter.outputs.plain }}'; A='${{ steps.filter.outputs.atomic }}'
+          fi
+          echo "plain=$P"  >> "$GITHUB_OUTPUT"
+          echo "atomic=$A" >> "$GITHUB_OUTPUT"
+          echo "== plain: $P | atomic: $A =="
+
+  # PLAIN (non-atomic Fedora KDE, mutable, persistent)
+  plain:
+    needs: changes
+    if: ${{ needs.changes.outputs.plain == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CM4 parts (cache)
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cm4
+          key: cm4-parts-v3-${{ env.IMG_MD5 }}
+
+      - name: Download official image + extract parts
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          curl -fL "$IMG_URL" -o official.img.bz2
+          echo "$IMG_MD5  official.img.bz2" | md5sum -c -
+          bunzip2 official.img.bz2
+          LOOP=$(sudo losetup -fP --show official.img)
+          mkdir -p boot root cm4/modules cm4/firmware
+          sudo mount "${LOOP}p1" boot
+          sudo mount "${LOOP}p2" root
+          cp boot/kernel8.img cm4/vmlinuz
+          cp -a boot/. cm4/firmware/
+          cp -a "root/usr/lib/modules/$KVER" "cm4/modules/$KVER"
+          mkdir -p cm4/fw-brcm cm4/fw-cypress
+          cp -a root/usr/lib/firmware/brcm/. cm4/fw-brcm/ 2>/dev/null || cp -a root/lib/firmware/brcm/. cm4/fw-brcm/
+          cp -a root/usr/lib/firmware/cypress/. cm4/fw-cypress/ 2>/dev/null || cp -a root/lib/firmware/cypress/. cm4/fw-cypress/
+          sudo umount boot root
+          sudo losetup -d "$LOOP"
+          rm -f official.img
+          sudo chown -R "$(id -u):$(id -g)" cm4
+
+      - run: sudo apt-get update && sudo apt-get install -y podman pigz pv
+
+      - id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/kinoite-uconsole" >> "$GITHUB_OUTPUT"
+
+      - name: ghcr.io login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build OS image
+        run: sudo podman build -f Containerfile.plain -t "${{ steps.img.outputs.name }}:plain" .
+
+      - name: Push to ghcr.io
+        run: sudo podman push "${{ steps.img.outputs.name }}:plain"
+
+      # Static boot via Pi firmware (no u-boot/ostree).
+      - name: Build flashable image
+        run: |
+          set -eux
+          CID=$(sudo podman create "${{ steps.img.outputs.name }}:plain")
+          sudo podman export "$CID" -o rootfs.tar
+          sudo podman rm "$CID"
+          mkdir -p rootfs
+          sudo tar -xpf rootfs.tar -C rootfs --numeric-owner
+          rm -f rootfs.tar
+          ROOTMB=$(sudo du -sm rootfs | cut -f1)
+          IMGMB=$(( ROOTMB + 1500 + 512 ))
+          truncate -s "${IMGMB}M" sdcard.img
+          sudo parted -s sdcard.img mklabel msdos \
+            mkpart primary fat32 1MiB 513MiB \
+            mkpart primary ext4 513MiB 100%
+          LOOP=$(sudo losetup -fP --show sdcard.img)
+          sudo mkfs.vfat -F32 -n BOOT "${LOOP}p1"
+          sudo mkfs.ext4 -F -L root "${LOOP}p2"
+          mkdir -p mnt/boot mnt/root
+          sudo mount "${LOOP}p2" mnt/root
+          sudo mount "${LOOP}p1" mnt/boot
+          sudo cp -a rootfs/. mnt/root/
+          sudo cp -r cm4/firmware/. mnt/boot/
+          echo 'console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait rw enforcing=0' \
+            | sudo tee mnt/boot/cmdline.txt
+          printf '/dev/mmcblk0p2 / ext4 defaults 0 1\n/dev/mmcblk0p1 /boot vfat defaults 0 2\n' \
+            | sudo tee mnt/root/etc/fstab
+          echo 'gpio=11=op,dh' | sudo tee -a mnt/boot/config.txt
+          sync
+          sudo umount mnt/boot mnt/root
+          sudo losetup -d "$LOOP"
+          sudo rm -rf rootfs mnt
+          mv sdcard.img fedora-kde-uconsole-cm4.img
+          echo "== compress plain (pigz) =="
+          pv -f -i 5 fedora-kde-uconsole-cm4.img | pigz -6 > fedora-kde-uconsole-cm4.img.gz
+          rm -f fedora-kde-uconsole-cm4.img
+          ls -lh fedora-kde-uconsole-cm4.img.gz
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -eu
+          F=fedora-kde-uconsole-cm4.img.gz
+          echo "== upload plain to R2 ($(du -h "$F" | cut -f1)) =="
+          aws s3 cp "$F" "s3://${R2_BUCKET}/${F}" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/gzip
+
+  # ATOMIC (Fedora Kinoite, ostree + u-boot, atomic updates + rollback)
+  atomic:
+    needs: changes
+    if: ${{ needs.changes.outputs.atomic == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Free runner ballast -> room for BIB + disk.raw.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/share/swift /usr/lib/jvm /opt/microsoft 2>/dev/null || true
+          df -h /
+
+      - name: CM4 parts (cache)
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cm4
+          key: cm4-parts-v3-${{ env.IMG_MD5 }}
+
+      - name: Download official image + extract parts
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          curl -fL "$IMG_URL" -o official.img.bz2
+          echo "$IMG_MD5  official.img.bz2" | md5sum -c -
+          bunzip2 official.img.bz2
+          LOOP=$(sudo losetup -fP --show official.img)
+          mkdir -p boot root cm4/modules cm4/firmware
+          sudo mount "${LOOP}p1" boot
+          sudo mount "${LOOP}p2" root
+          cp boot/kernel8.img cm4/vmlinuz
+          cp -a boot/. cm4/firmware/
+          cp -a "root/usr/lib/modules/$KVER" "cm4/modules/$KVER"
+          mkdir -p cm4/fw-brcm cm4/fw-cypress
+          cp -a root/usr/lib/firmware/brcm/. cm4/fw-brcm/ 2>/dev/null || cp -a root/lib/firmware/brcm/. cm4/fw-brcm/
+          cp -a root/usr/lib/firmware/cypress/. cm4/fw-cypress/ 2>/dev/null || cp -a root/lib/firmware/cypress/. cm4/fw-cypress/
+          sudo umount boot root
+          sudo losetup -d "$LOOP"
+          rm -f official.img
+          sudo chown -R "$(id -u):$(id -g)" cm4
+
+      - run: sudo apt-get update && sudo apt-get install -y podman pigz pv
+
+      - id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/kinoite-uconsole" >> "$GITHUB_OUTPUT"
+
+      - name: ghcr.io login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build OS image
+        run: sudo podman build -f Containerfile.atomic -t "${{ steps.img.outputs.name }}:atomic" .
+
+      - name: Push to ghcr.io
+        run: sudo podman push "${{ steps.img.outputs.name }}:atomic"
+
+      # bootc-image-builder produces the real ostree/GRUB disk (persistent /var,
+      # rollback). Output: raw GPT image.
+      - name: Build ostree disk (bootc-image-builder)
+        run: |
+          set -eux
+          mkdir -p output
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            -v "$PWD/output":/output \
+            -v "$PWD/bib-atomic.toml":/config.toml:ro \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type raw --rootfs ext4 --local "${{ steps.img.outputs.name }}:atomic"
+          sudo chown -R "$(id -u):$(id -g)" output
+          find output -name '*.raw'
+
+      # Boot chain on the ESP: Pi firmware -> u-boot -> (EFI) GRUB -> ostree.
+      - name: Install Pi firmware + u-boot, pack
+        run: |
+          set -eux
+          RAW=$(find output -name '*.raw' | head -1)
+          test -n "$RAW"
+          sudo podman run --rm quay.io/fedora/fedora:44 sh -c \
+            'dnf install -y uboot-images-armv8 >/dev/null 2>&1 && cat /usr/share/uboot/rpi_arm64/u-boot.bin' > u-boot.bin
+          test -s u-boot.bin
+          LOOP=$(sudo losetup -fP --show "$RAW")
+          sudo partprobe "$LOOP" 2>/dev/null || true
+          sudo udevadm settle 2>/dev/null || true
+          sleep 2
+          echo "=== partition table ==="
+          sudo sgdisk -p "$RAW" 2>/dev/null || sudo parted -s "$RAW" print || true
+          echo "=== lsblk ==="; lsblk -p -o NAME,FSTYPE,SIZE,PARTLABEL "$LOOP" || true
+          # ESP = first vfat partition; -l (list mode) avoids tree glyphs in NAME
+          ESP="$(lsblk -pnl -o NAME,FSTYPE "$LOOP" | awk '$2=="vfat"{print $1; exit}')"
+          if [ -z "$ESP" ]; then
+            for p in $(lsblk -pnl -o NAME "$LOOP" | tail -n +2); do
+              [ "$(sudo blkid -o value -s TYPE "$p" 2>/dev/null)" = "vfat" ] && { ESP="$p"; break; }
+            done
+          fi
+          echo "ESP=$ESP"
+          test -n "$ESP"
+          mkdir -p esp
+          sudo mount "$ESP" esp
+          sudo cp -r cm4/firmware/. esp/
+          sudo cp u-boot.bin esp/u-boot.bin
+          sudo rm -f esp/cmdline.txt
+          printf '\n# uConsole atomic: Pi firmware -> u-boot -> GRUB(EFI) -> ostree\nkernel=u-boot.bin\narm_64bit=1\nenable_uart=1\ngpio=11=op,dh\n' \
+            | sudo tee -a esp/config.txt
+          sync
+          sudo umount esp
+          sudo losetup -d "$LOOP"
+          mv "$RAW" kinoite-uconsole-cm4.img
+          echo "== compress atomic (pigz) =="
+          pv -f -i 5 kinoite-uconsole-cm4.img | pigz -6 > kinoite-uconsole-cm4.img.gz
+          rm -f kinoite-uconsole-cm4.img
+          ls -lh kinoite-uconsole-cm4.img.gz
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -eu
+          F=kinoite-uconsole-cm4.img.gz
+          echo "== upload atomic to R2 ($(du -h "$F" | cut -f1)) =="
+          aws s3 cp "$F" "s3://${R2_BUCKET}/${F}" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/gzip

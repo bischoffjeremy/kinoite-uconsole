@@ -1,0 +1,7 @@
+# bootc-image-builder blueprint for the atomic image (Fedora Kinoite).
+# Defines the default user (no autologin); on an immutable image the user
+# must be declared here, not at runtime.
+[[customizations.user]]
+name = "uconsole"
+password = "uconsole"
+groups = ["wheel"]

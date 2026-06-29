@@ -1,0 +1,15 @@
+[Unit]
+Description=Grow root partition + filesystem to fill the disk (once)
+# Stamp in persistent /var so it runs only once per installation.
+ConditionPathExists=!/var/lib/uconsole-growroot.done
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/uconsole-growroot
+ExecStartPost=/bin/touch /var/lib/uconsole-growroot.done
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+#!/bin/bash
+# Grow the root partition + filesystem once to fill the whole disk.
+# The image is built at a fixed size, so flashing it to a larger eMMC/SD leaves
+# the rest unpartitioned. On first boot this extends the last partition into the
+# free space and resizes the ext4 filesystem online.
+set -eu
+
+# Find the physical root partition: ostree mounts it at /sysroot, the
+# plain/mutable image directly at /.
+root_src="$(findmnt -no SOURCE /sysroot 2>/dev/null || true)"
+[ -n "$root_src" ] || root_src="$(findmnt -no SOURCE /)"
+# Strip any [subvol] decoration.
+root_src="${root_src%%[*}"
+
+base="$(basename "$root_src")"
+parent="$(lsblk -no PKNAME "$root_src" | head -1)"
+[ -n "$parent" ] || { echo "growroot: cannot determine parent disk for $root_src"; exit 0; }
+disk="/dev/$parent"
+partnum="$(cat "/sys/class/block/$base/partition")"
+
+echo "growroot: disk=$disk part=$partnum root=$root_src"
+
+# Extend the partition into free space (no-op if already maxed), then grow ext4.
+growpart "$disk" "$partnum" || true
+resize2fs "$root_src" || true
